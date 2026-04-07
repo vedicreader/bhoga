@@ -80,6 +80,9 @@ _DEFAULTS: dict[str, Any] = {
             "priority": 1,
             "quota_source": "cli_parse",
             "cli_cmd": ["codex", "--non-interactive", "/status"],
+            # Local Codex files — used for model discovery when CLI is unavailable
+            "models_cache":  "~/.codex/models_cache.json",
+            "models_config": "~/.codex/config.toml",
             "windows": {
                 "burst":  {"default_minutes": 300},
                 "weekly": {"default_minutes": 10080},
@@ -100,18 +103,34 @@ _DEFAULTS: dict[str, Any] = {
             "cadence": "monthly",   # premium requests reset 1st of month UTC
             "base_url":  "https://api.githubcopilot.com",
             "models_url": "https://api.githubcopilot.com/models",
-            "auth_env": "GITHUB_TOKEN",
+            # Token resolution order (matching copilot_auth.py in hermes-agent)
+            "auth_env": "COPILOT_GITHUB_TOKEN",
+            "auth_env_fallbacks": ("GH_TOKEN", "GITHUB_TOKEN"),
             "hdr_rem":   "x-ratelimit-remaining-requests",
             "hdr_limit": "x-ratelimit-limit-requests",
             "hdr_rst":   "x-ratelimit-reset-requests",
+            # Required on every Copilot API request (per hermes-agent copilot_auth.py)
+            "request_headers": {
+                "Editor-Version":   "vscode/1.104.1",
+                "Openai-Intent":    "conversation-edits",
+                "x-initiator":      "agent",
+            },
         },
     },
+    # Maps bhoga provider_id → Hermes canonical provider ID
     "hermes_provider": {
         "claude_code":    "anthropic",
         "anthropic_api":  "anthropic",
         "openai-codex":   "openai-codex",
-        "openai_api":     "openai",
-        "github-copilot": "github-copilot",
+        "openai_api":     "openrouter",   # OpenAI direct routes via OpenRouter in Hermes
+        "github-copilot": "copilot",      # Hermes canonical ID is "copilot", not "github-copilot"
+    },
+    # Maps Hermes provider ID → wire protocol (api_mode in Hermes runtime)
+    "hermes_api_mode": {
+        "anthropic":    "anthropic_messages",
+        "openai-codex": "codex_responses",
+        "copilot":      "chat_completions",
+        "openrouter":   "chat_completions",
     },
 }
 
@@ -131,10 +150,37 @@ def cfg(pid: str) -> dict[str, Any]:
     """Provider config dict from defaults."""
     return _DEFAULTS["providers"].get(pid, {})
 
+# Maps model family → vendor prefix used by aggregator APIs (OpenRouter, Nous)
+_VENDOR_TO_HERMES: dict[str, str] = {
+    "anthropic": "anthropic",
+    "openai":    "openai",
+    "google":    "google",
+    "other":     "openai",
+}
+
 def to_hermes_model(pid: str, mid: str) -> str:
-    """Convert bhoga provider+model to Hermes `provider/model` string."""
+    """Convert bhoga provider+model to a correctly-normalised Hermes model string.
+
+    Normalisation rules (per hermes-agent ``model_normalize.py``):
+
+    - ``openrouter``: ``vendor/model`` with dots preserved, e.g. ``anthropic/claude-sonnet-4.6``
+    - ``anthropic`` (direct API): bare name, dots → hyphens, e.g. ``claude-sonnet-4-6``
+    - ``copilot``: bare name, dots preserved, e.g. ``claude-sonnet-4.6``
+    - ``openai-codex``: bare name, e.g. ``gpt-5.4``
+    """
     hp = _DEFAULTS["hermes_provider"].get(pid, "openrouter")
-    return f"{hp}/{mid}"
+    # Strip any existing vendor prefix (e.g. "anthropic/claude-opus-4" → "claude-opus-4")
+    bare = mid.split("/")[-1]
+    if hp == "openrouter":
+        vendor = _VENDOR_TO_HERMES.get(model_family(mid), "openai")
+        return f"{vendor}/{bare}"
+    if hp == "anthropic":
+        # Anthropic native API: dots → hyphens
+        return bare.replace(".", "-")
+    if hp in ("copilot", "openai-codex"):
+        # Bare name, dots preserved
+        return bare
+    return bare
 
 # ── Dataclasses ──────────────────────────────────────────────────────────────
 
@@ -347,16 +393,29 @@ def fetch_models(pid: str) -> list[str]:
     """List model IDs available from a provider's API."""
     c = cfg(pid)
     url = c.get("models_url")
-    auth_env = c.get("auth_env", "")
     if not url:
         return []
-    key = os.environ.get(auth_env, "")
+
+    # Resolve API key — Copilot uses a priority env var chain
+    if pid == "github-copilot":
+        key = (os.environ.get("COPILOT_GITHUB_TOKEN")
+               or os.environ.get("GH_TOKEN")
+               or os.environ.get("GITHUB_TOKEN", ""))
+    else:
+        auth_env = c.get("auth_env", "")
+        key = os.environ.get(auth_env, "")
+
     if not key:
         return []
+
     headers: dict[str, str] = {}
     if pid == "github-copilot":
-        headers = {"Authorization": f"Bearer {key}",
-                    "X-GitHub-Api-Version": "2022-11-28"}
+        # Required headers per hermes-agent copilot_auth.py + hermes_cli/models.py
+        headers = {
+            "Authorization": f"Bearer {key}",
+            "Editor-Version": "vscode/1.104.1",
+            "X-GitHub-Api-Version": "2022-11-28",
+        }
     elif pid == "anthropic_api":
         headers = {"x-api-key": key, "anthropic-version": "2023-06-01"}
     else:
@@ -368,7 +427,9 @@ def fetch_models(pid: str) -> list[str]:
         # OpenAI / Anthropic: {"data": [{"id": ...}]}
         if isinstance(data, dict) and "data" in data:
             return [m["id"] for m in data["data"] if "id" in m]
-        # GitHub Models: [{"id": ...}]
+        # Copilot models endpoint: [{"id": ...}] or {"models": [{"id": ...}]}
+        if isinstance(data, dict) and "models" in data:
+            return [m["id"] for m in data["models"] if "id" in m]
         if isinstance(data, list):
             return [m["id"] for m in data if "id" in m]
     except Exception as e:
@@ -496,14 +557,15 @@ def parse_codex_quota() -> dict[str, QuotaWindow] | None:
         now = datetime.now(timezone.utc)
         if "burst" in data or "five_hour" in data:
             burst = data.get("burst") or data.get("five_hour", {})
-            pct_used = float(burst.get("pct_used", burst.get("utilization", 0))) * (
-                1 if burst.get("pct_used") is not None else 100)
+            # pct_used is 0-100; utilization is 0-1 → scale to 0-100
+            raw = burst.get("pct_used")
+            pct_used = float(raw) if raw is not None else float(burst.get("utilization", 0)) * 100.0
             windows["burst"] = QuotaWindow(name="burst", pct_used=pct_used,
                                            window_min=300, updated_at=now)
         if "weekly" in data or "seven_day" in data:
             weekly = data.get("weekly") or data.get("seven_day", {})
-            pct_used = float(weekly.get("pct_used", weekly.get("utilization", 0))) * (
-                1 if weekly.get("pct_used") is not None else 100)
+            raw = weekly.get("pct_used")
+            pct_used = float(raw) if raw is not None else float(weekly.get("utilization", 0)) * 100.0
             windows["weekly"] = QuotaWindow(name="weekly", pct_used=pct_used,
                                             window_min=10080, updated_at=now)
         if windows:
@@ -535,6 +597,88 @@ def check_quota(pid: str) -> dict[str, QuotaWindow] | None:
     if pid == "openai-codex":
         return parse_codex_quota()
     return None
+
+
+# Default Codex model list (from hermes-agent hermes_cli/codex_models.py)
+_CODEX_DEFAULT_MODELS: list[str] = [
+    "gpt-5.4-mini",
+    "gpt-5.4",
+    "gpt-5.3-codex",
+    "gpt-5.2-codex",
+    "gpt-5.1-codex-max",
+    "gpt-5.1-codex-mini",
+]
+
+
+def get_codex_models() -> list[str]:
+    """Return available Codex model IDs from local files or built-in defaults.
+
+    Resolution order (no network call required):
+
+    1. ``~/.codex/models_cache.json`` — written by Codex CLI on first run.
+       Skips models that are hidden or not supported in the API.
+    2. ``~/.codex/config.toml`` — the model the user has configured.
+    3. Built-in defaults (current Codex model line-up).
+
+    Use this as a lightweight way to discover Codex models without running
+    ``codex --non-interactive /status``.  Quota is tracked separately via
+    ``parse_codex_quota()`` or ``Router.set_quota()``.
+    """
+    c = cfg("openai-codex")
+    ordered: list[str] = []
+    seen: set[str] = set()
+
+    def _add(mid: str) -> None:
+        if mid and mid not in seen:
+            ordered.append(mid)
+            seen.add(mid)
+
+    # 1. models_cache.json
+    cache_path = Path(c.get("models_cache", "~/.codex/models_cache.json")).expanduser()
+    if cache_path.exists():
+        try:
+            raw = json.loads(cache_path.read_text())
+            entries = raw.get("models", []) if isinstance(raw, dict) else []
+            sortable = []
+            for item in entries:
+                if not isinstance(item, dict):
+                    continue
+                slug = item.get("slug", "").strip()
+                if not slug:
+                    continue
+                if item.get("supported_in_api") is False:
+                    continue
+                vis = item.get("visibility", "")
+                if isinstance(vis, str) and vis.strip().lower() in ("hide", "hidden"):
+                    continue
+                priority = item.get("priority")
+                rank = int(priority) if isinstance(priority, (int, float)) else 10_000
+                sortable.append((rank, slug))
+            sortable.sort()
+            for _, slug in sortable:
+                _add(slug)
+        except Exception as e:
+            log.debug("bhoga: get_codex_models cache read failed: %s", e)
+
+    # 2. config.toml default model
+    config_path = Path(c.get("models_config", "~/.codex/config.toml")).expanduser()
+    if config_path.exists():
+        try:
+            # tomllib is stdlib in Python 3.11+; ImportError is caught by the
+            # outer except, so get_codex_models() degrades gracefully on 3.10-.
+            import tomllib  # noqa: PLC0415
+            payload = tomllib.loads(config_path.read_text())
+            model = payload.get("model", "")
+            if isinstance(model, str) and model.strip():
+                _add(model.strip())
+        except Exception as e:
+            log.debug("bhoga: get_codex_models config read failed: %s", e)
+
+    # 3. Built-in defaults
+    for mid in _CODEX_DEFAULT_MODELS:
+        _add(mid)
+
+    return ordered
 
 # ── Router ───────────────────────────────────────────────────────────────────
 
@@ -675,9 +819,11 @@ class Router:
                  or self._state.get(self._key(pid, "*"))
                  or blank(pid, model))
             # Shallow-copy scalar fields before releasing lock so calibrate/
-            # mark_throttled can run without holding it.
+            # mark_throttled can run without holding it.  ProviderQuota only has
+            # scalar fields + the windows dict; QuotaWindow itself has only
+            # scalar fields — so shallow copy is safe here.
             q = copy.copy(q)
-            q.windows = dict(q.windows)   # copy windows mapping too
+            q.windows = dict(q.windows)   # copy the mapping (values stay shared)
             q.consumed += inp + out
             q.n_requests += 1
 
@@ -782,14 +928,18 @@ def apply_to_hermes(router: Router, model: str,
     """Write the best provider for *model* into Hermes config.yaml.
 
     Always updates:
-    - ``model`` — the ``provider/model`` string Hermes should use
-    - ``compression.summary_provider`` — keeps summarisation in sync
+
+    - ``model`` — written as a dict ``{default, provider, api_mode}`` so
+      Hermes picks up the correct wire protocol automatically (e.g.
+      ``codex_responses`` for ``openai-codex``, ``anthropic_messages``
+      for the Anthropic direct API).
+    - ``compression.summary_provider`` — keeps summarisation in sync.
 
     Optionally (``write_auxiliary=True``) also overwrites all auxiliary
     task providers (vision, web_extract, compression, …).
 
-    For GitHub Copilot, writes a non-destructive provider stub so Hermes
-    knows the base URL and auth env var.
+    For GitHub Copilot, writes a non-destructive ``providers.copilot``
+    stub so Hermes knows the base URL and auth env var.
 
     Returns True if config was written, False on failure.
     """
@@ -804,32 +954,36 @@ def apply_to_hermes(router: Router, model: str,
     else:
         config = {}
 
-    hermes_pid = _DEFAULTS["hermes_provider"].get(rec.provider_id, "openrouter")
+    hermes_pid  = _DEFAULTS["hermes_provider"].get(rec.provider_id, "openrouter")
+    api_mode    = _DEFAULTS["hermes_api_mode"].get(hermes_pid, "chat_completions")
+    hermes_name = to_hermes_model(rec.provider_id, model)
 
-    # Always set main model
-    config["model"] = rec.hermes_model
+    # Write model as a structured dict so Hermes gets provider + api_mode too
+    config["model"] = {
+        "default":  hermes_name,
+        "provider": hermes_pid,
+        "api_mode": api_mode,
+    }
 
-    # Always set compression summary provider
-    compression = config.setdefault("compression", {})
-    compression["summary_provider"] = hermes_pid
+    # Always keep compression in sync
+    config.setdefault("compression", {})["summary_provider"] = hermes_pid
 
     # Optional: overwrite all auxiliary task providers
     if write_auxiliary:
         auxiliary = config.setdefault("auxiliary", {})
         for task in ("vision", "web_extract", "compression", "session_search",
                      "skills_hub", "approval", "mcp", "flush_memories"):
-            task_cfg = auxiliary.setdefault(task, {})
-            task_cfg["provider"] = hermes_pid
+            auxiliary.setdefault(task, {})["provider"] = hermes_pid
 
-    # Non-destructive Copilot provider stub so Hermes knows the endpoint
+    # Non-destructive Copilot provider stub (Hermes canonical key: "copilot")
     if rec.provider_id == "github-copilot":
         providers = config.setdefault("providers", {})
-        if "github-copilot" not in providers:
-            providers["github-copilot"] = {
-                "type": "openai_compatible",
-                "base_url": cfg("github-copilot").get("base_url",
-                                "https://api.githubcopilot.com"),
-                "api_key_env": cfg("github-copilot").get("auth_env", "GITHUB_TOKEN"),
+        if "copilot" not in providers:
+            providers["copilot"] = {
+                "type":        "openai_compatible",
+                "base_url":    cfg("github-copilot").get("base_url",
+                                   "https://api.githubcopilot.com"),
+                "api_key_env": "COPILOT_GITHUB_TOKEN",
             }
 
     path.parent.mkdir(parents=True, exist_ok=True)
