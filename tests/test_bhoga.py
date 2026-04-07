@@ -17,6 +17,7 @@ from bhoga import (
     RouterRecommendation,
     apply_to_hermes,
     calibrate,
+    get_codex_models,
     mark_throttled,
     model_family,
     to_hermes_model,
@@ -49,13 +50,27 @@ def test_hierarchy_openai():
     assert h == ["openai-codex", "openai_api", "github-copilot"]
 
 
-# ── to_hermes_model ──────────────────────────────────────────────────────────
+# ── to_hermes_model / normalization ──────────────────────────────────────────
 
 def test_hermes_model_string():
-    assert to_hermes_model("claude_code", "claude-opus-4") == "anthropic/claude-opus-4"
-    assert to_hermes_model("openai-codex", "gpt-4.1") == "openai-codex/gpt-4.1"
-    assert to_hermes_model("github-copilot", "gpt-4.1") == "github-copilot/gpt-4.1"
-    assert to_hermes_model("openai_api", "gpt-4.1") == "openrouter/gpt-4.1"
+    # anthropic direct API → bare name with dots-to-hyphens, no vendor prefix
+    assert to_hermes_model("claude_code",    "claude-opus-4")     == "claude-opus-4"
+    assert to_hermes_model("anthropic_api",  "claude-sonnet-4.6") == "claude-sonnet-4-6"
+    # openai-codex → bare name, dots preserved
+    assert to_hermes_model("openai-codex",   "gpt-4.1")           == "gpt-4.1"
+    # copilot → bare name, dots preserved
+    assert to_hermes_model("github-copilot", "gpt-4.1")           == "gpt-4.1"
+    assert to_hermes_model("github-copilot", "claude-sonnet-4.6") == "claude-sonnet-4.6"
+    # openai_api → openrouter aggregator: vendor/model
+    assert to_hermes_model("openai_api",     "gpt-4.1")           == "openai/gpt-4.1"
+
+def test_hermes_model_strips_existing_vendor_prefix():
+    """Vendor prefix already present should not be doubled."""
+    assert to_hermes_model("openai_api", "openai/gpt-4.1") == "openai/gpt-4.1"
+
+def test_hermes_model_anthropic_dots_to_hyphens():
+    assert to_hermes_model("anthropic_api", "claude-sonnet-4.6") == "claude-sonnet-4-6"
+    assert to_hermes_model("claude_code",   "claude-haiku-4.5")  == "claude-haiku-4-5"
 
 
 # ── QuotaWindow ──────────────────────────────────────────────────────────────
@@ -182,6 +197,18 @@ def test_calibrate_anthropic():
     assert q.calibrated == 50_000
     assert q.ceiling == 1_000_000
     assert q.status == ProviderStatus.LOW
+
+def test_calibrate_copilot_request_headers():
+    """Copilot calibration uses request-based headers."""
+    q = ProviderQuota(provider_id="github-copilot", model_id="gpt-4.1",
+                      ceiling=300)
+    calibrate(q, {
+        "x-ratelimit-remaining-requests": "250",
+        "x-ratelimit-limit-requests": "300",
+    })
+    assert q.calibrated == 250
+    assert q.ceiling == 300
+    assert q.status == ProviderStatus.OK
 
 
 # ── mark_throttled ───────────────────────────────────────────────────────────
@@ -312,10 +339,129 @@ def test_record_turn_429_throttles(tmp_path):
     assert not q2.is_usable()
 
 
+# ── Router.set_quota ─────────────────────────────────────────────────────────
+
+def test_set_quota_windowed_burst(tmp_path):
+    """set_quota on a windowed provider sets burst window."""
+    r = Router(state_path=tmp_path / "state.json", eager=False)
+    r.set_quota("openai-codex", pct_remaining=75.0)
+    q = r._get("openai-codex", "*")
+    assert q is not None
+    assert q.windows["burst"].pct_used == pytest.approx(25.0)
+    assert q.quota_pct == pytest.approx(0.75, abs=0.01)
+    assert q.status == ProviderStatus.OK
+
+def test_set_quota_windowed_both_windows(tmp_path):
+    """set_quota with weekly_pct sets both burst and weekly independently."""
+    r = Router(state_path=tmp_path / "state.json", eager=False)
+    r.set_quota("claude_code", pct_remaining=90.0, weekly_pct=60.0)
+    q = r._get("claude_code", "*")
+    assert q is not None
+    assert q.windows["burst"].pct_used  == pytest.approx(10.0)
+    assert q.windows["weekly"].pct_used == pytest.approx(40.0)
+    # quota_pct = min(90%, 60%) / 100 = 0.60
+    assert q.quota_pct == pytest.approx(0.60, abs=0.01)
+
+def test_set_quota_windowed_weekly_defaults_to_burst(tmp_path):
+    """If weekly_pct is omitted, it defaults to pct_remaining."""
+    r = Router(state_path=tmp_path / "state.json", eager=False)
+    r.set_quota("claude_code", pct_remaining=50.0)
+    q = r._get("claude_code", "*")
+    assert q.windows["burst"].pct_used  == pytest.approx(50.0)
+    assert q.windows["weekly"].pct_used == pytest.approx(50.0)
+
+def test_set_quota_token_based(tmp_path):
+    """set_quota on a token/request-based provider sets calibrated."""
+    r = Router(state_path=tmp_path / "state.json", eager=False)
+    q0 = blank("github-copilot", "*")
+    q0.ceiling = 500
+    r._put(q0)
+    r.set_quota("github-copilot", pct_remaining=80.0)
+    q = r._get("github-copilot", "*")
+    assert q is not None
+    assert q.calibrated == 400   # 80% of 500
+    assert q.status == ProviderStatus.OK
+
+def test_set_quota_persists_to_disk(tmp_path):
+    """set_quota should be persisted so a new Router instance can read it."""
+    p = tmp_path / "state.json"
+    r1 = Router(state_path=p, eager=False)
+    r1.set_quota("openai-codex", pct_remaining=55.0)
+    r2 = Router(state_path=p, eager=False)
+    q = r2._get("openai-codex", "*")
+    assert q is not None
+    assert q.windows["burst"].pct_used == pytest.approx(45.0)
+
+def test_set_quota_invalid_range(tmp_path):
+    """set_quota should raise on out-of-range values."""
+    r = Router(state_path=tmp_path / "state.json", eager=False)
+    with pytest.raises(ValueError):
+        r.set_quota("openai-codex", pct_remaining=110.0)
+    with pytest.raises(ValueError):
+        r.set_quota("openai-codex", pct_remaining=50.0, weekly_pct=-1.0)
+
+def test_set_quota_affects_routing(tmp_path):
+    """A provider with set_quota=0 should be treated as exhausted and skipped."""
+    p = tmp_path / "state.json"
+    r = Router(state_path=p, eager=False)
+    r.set_quota("claude_code",  pct_remaining=0.0)
+    r.set_quota("anthropic_api", pct_remaining=70.0)
+    # Force anthropic_api into state with a ceiling so quota_pct is meaningful
+    q = r._get("anthropic_api", "*")
+    assert q is not None
+    rec = r.best_for("claude-opus-4")
+    assert rec is not None
+    assert rec.provider_id == "anthropic_api"
+
+def test_set_quota_specific_model(tmp_path):
+    """set_quota can target a specific model key."""
+    r = Router(state_path=tmp_path / "state.json", eager=False)
+    r.set_quota("anthropic_api", pct_remaining=60.0, model="claude-opus-4")
+    q = r._get("anthropic_api", "claude-opus-4")
+    assert q is not None
+    assert q.calibrated == 600_000  # 60% of default ceiling 1_000_000
+
+
+# ── get_codex_models ─────────────────────────────────────────────────────────
+
+def test_get_codex_models_returns_defaults():
+    """Without local files present, returns the hardcoded default list."""
+    from bhoga.bhoga import _CODEX_DEFAULT_MODELS
+    models = get_codex_models()
+    assert isinstance(models, list)
+    assert len(models) > 0
+    for mid in _CODEX_DEFAULT_MODELS:
+        assert mid in models
+
+def test_get_codex_models_reads_cache(tmp_path):
+    """models_cache.json is read when available."""
+    cache = tmp_path / "models_cache.json"
+    cache.write_text(json.dumps({"models": [
+        {"slug": "gpt-5.4", "priority": 1, "supported_in_api": True},
+        {"slug": "gpt-5.4-mini", "priority": 2, "supported_in_api": True},
+        {"slug": "hidden-model", "priority": 3, "visibility": "hide"},
+    ]}))
+    from bhoga import bhoga as bhoga_mod
+    orig = bhoga_mod._DEFAULTS["providers"]["openai-codex"]["models_cache"]
+    bhoga_mod._DEFAULTS["providers"]["openai-codex"]["models_cache"] = str(cache)
+    try:
+        models = get_codex_models()
+        assert "gpt-5.4" in models
+        assert "gpt-5.4-mini" in models
+        assert "hidden-model" not in models
+    finally:
+        bhoga_mod._DEFAULTS["providers"]["openai-codex"]["models_cache"] = orig
+
+def test_get_codex_models_no_duplicates():
+    """No model ID should appear twice."""
+    models = get_codex_models()
+    assert len(models) == len(set(models))
+
+
 # ── Hermes integration ───────────────────────────────────────────────────────
 
 def test_apply_to_hermes(tmp_path):
-    """apply_to_hermes should write correct Hermes config."""
+    """apply_to_hermes writes dict model format with provider + api_mode."""
     state_path = tmp_path / "state.json"
     config_path = tmp_path / "config.yaml"
     now = datetime.now(timezone.utc)
@@ -334,7 +480,113 @@ def test_apply_to_hermes(tmp_path):
     assert ok
 
     config = yaml.safe_load(config_path.read_text())
-    assert config["model"] == "anthropic/claude-opus-4"
+    # model is now a dict with provider and api_mode
+    assert isinstance(config["model"], dict)
+    assert config["model"]["default"]  == "claude-opus-4"
+    assert config["model"]["provider"] == "anthropic"
+    assert config["model"]["api_mode"] == "anthropic_messages"
     assert config["compression"]["summary_provider"] == "anthropic"
+    # auxiliary NOT written by default
+    assert "auxiliary" not in config
+
+def test_apply_to_hermes_write_auxiliary(tmp_path):
+    """write_auxiliary=True populates all auxiliary task providers."""
+    state_path = tmp_path / "state.json"
+    config_path = tmp_path / "config.yaml"
+    now = datetime.now(timezone.utc)
+
+    state = {
+        "claude_code:*": ProviderQuota(
+            provider_id="claude_code", model_id="*", priority=1,
+            windows={"burst": QuotaWindow(name="burst", pct_used=20.0,
+                                           updated_at=now, window_min=300)},
+        ),
+    }
+    save_state(state, state_path)
+    r = Router(state_path=state_path, eager=False)
+
+    ok = apply_to_hermes(r, "claude-opus-4", config_path=config_path,
+                         write_auxiliary=True)
+    assert ok
+
+    config = yaml.safe_load(config_path.read_text())
     assert config["auxiliary"]["vision"]["provider"] == "anthropic"
     assert config["auxiliary"]["compression"]["provider"] == "anthropic"
+
+def test_apply_to_hermes_codex_api_mode(tmp_path):
+    """openai-codex provider should produce api_mode=codex_responses."""
+    state_path = tmp_path / "state.json"
+    config_path = tmp_path / "config.yaml"
+    now = datetime.now(timezone.utc)
+
+    state = {
+        "openai-codex:*": ProviderQuota(
+            provider_id="openai-codex", model_id="*", priority=1,
+            windows={"burst": QuotaWindow(name="burst", pct_used=10.0,
+                                           updated_at=now, window_min=300)},
+        ),
+    }
+    save_state(state, state_path)
+    r = Router(state_path=state_path, eager=False)
+
+    ok = apply_to_hermes(r, "gpt-5.4", config_path=config_path)
+    assert ok
+
+    config = yaml.safe_load(config_path.read_text())
+    assert config["model"]["provider"] == "openai-codex"
+    assert config["model"]["api_mode"] == "codex_responses"
+    assert config["model"]["default"]  == "gpt-5.4"
+
+def test_apply_to_hermes_copilot_stub(tmp_path):
+    """Copilot provider should write a providers.copilot stub."""
+    state_path = tmp_path / "state.json"
+    config_path = tmp_path / "config.yaml"
+    now = datetime.now(timezone.utc)
+
+    state = {
+        "github-copilot:*": ProviderQuota(
+            provider_id="github-copilot", model_id="*", priority=3,
+            ceiling=300, calibrated=280,
+        ),
+    }
+    save_state(state, state_path)
+    r = Router(state_path=state_path, eager=False)
+
+    ok = apply_to_hermes(r, "gpt-4.1", config_path=config_path)
+    assert ok
+
+    config = yaml.safe_load(config_path.read_text())
+    # Hermes canonical ID for Copilot is "copilot"
+    assert config["model"]["provider"] == "copilot"
+    assert config["model"]["api_mode"] == "chat_completions"
+    # Non-destructive stub under providers.copilot
+    assert "copilot" in config.get("providers", {})
+    stub = config["providers"]["copilot"]
+    assert stub["base_url"] == "https://api.githubcopilot.com"
+    assert stub["api_key_env"] == "COPILOT_GITHUB_TOKEN"
+
+def test_apply_to_hermes_copilot_stub_not_overwritten(tmp_path):
+    """Existing providers.copilot entry should not be overwritten."""
+    state_path  = tmp_path / "state.json"
+    config_path = tmp_path / "config.yaml"
+    now = datetime.now(timezone.utc)
+
+    # Pre-existing config with a custom copilot stub
+    config_path.write_text(yaml.dump({
+        "providers": {"copilot": {"base_url": "https://my-proxy.example.com"}},
+    }))
+
+    state = {
+        "github-copilot:*": ProviderQuota(
+            provider_id="github-copilot", model_id="*", priority=3,
+            ceiling=300, calibrated=200,
+        ),
+    }
+    save_state(state, state_path)
+    r = Router(state_path=state_path, eager=False)
+    apply_to_hermes(r, "gpt-4.1", config_path=config_path)
+
+    config = yaml.safe_load(config_path.read_text())
+    # Should preserve the user's custom URL
+    assert config["providers"]["copilot"]["base_url"] == "https://my-proxy.example.com"
+

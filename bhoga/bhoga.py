@@ -8,7 +8,7 @@ Design: fastai/fastcore style — succinct, annotated, no ceremony.
 """
 from __future__ import annotations
 
-import json, logging, os, re, subprocess, threading, time
+import copy, json, logging, os, queue, re, subprocess, threading, time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import StrEnum, auto
@@ -80,6 +80,9 @@ _DEFAULTS: dict[str, Any] = {
             "priority": 1,
             "quota_source": "cli_parse",
             "cli_cmd": ["codex", "--non-interactive", "/status"],
+            # Local Codex files — used for model discovery when CLI is unavailable
+            "models_cache":  "~/.codex/models_cache.json",
+            "models_config": "~/.codex/config.toml",
             "windows": {
                 "burst":  {"default_minutes": 300},
                 "weekly": {"default_minutes": 10080},
@@ -97,19 +100,37 @@ _DEFAULTS: dict[str, Any] = {
         "github-copilot": {
             "family": "universal",
             "priority": 3,
-            "cadence": "hourly",
-            "models_url": "https://models.github.ai/catalog/models",
-            "auth_env": "GITHUB_TOKEN",
-            "hdr_rem": "x-ratelimit-remaining-tokens",
-            "hdr_rst": "x-ratelimit-reset",
+            "cadence": "monthly",   # premium requests reset 1st of month UTC
+            "base_url":  "https://api.githubcopilot.com",
+            "models_url": "https://api.githubcopilot.com/models",
+            # Token resolution order (matching copilot_auth.py in hermes-agent)
+            "auth_env": "COPILOT_GITHUB_TOKEN",
+            "auth_env_fallbacks": ("GH_TOKEN", "GITHUB_TOKEN"),
+            "hdr_rem":   "x-ratelimit-remaining-requests",
+            "hdr_limit": "x-ratelimit-limit-requests",
+            "hdr_rst":   "x-ratelimit-reset-requests",
+            # Required on every Copilot API request (per hermes-agent copilot_auth.py)
+            "request_headers": {
+                "Editor-Version":   "vscode/1.104.1",
+                "Openai-Intent":    "conversation-edits",
+                "x-initiator":      "agent",
+            },
         },
     },
+    # Maps bhoga provider_id → Hermes canonical provider ID
     "hermes_provider": {
         "claude_code":    "anthropic",
         "anthropic_api":  "anthropic",
         "openai-codex":   "openai-codex",
-        "openai_api":     "openrouter",
-        "github-copilot": "github-copilot",
+        "openai_api":     "openrouter",   # OpenAI direct routes via OpenRouter in Hermes
+        "github-copilot": "copilot",      # Hermes canonical ID is "copilot", not "github-copilot"
+    },
+    # Maps Hermes provider ID → wire protocol (api_mode in Hermes runtime)
+    "hermes_api_mode": {
+        "anthropic":    "anthropic_messages",
+        "openai-codex": "codex_responses",
+        "copilot":      "chat_completions",
+        "openrouter":   "chat_completions",
     },
 }
 
@@ -129,10 +150,37 @@ def cfg(pid: str) -> dict[str, Any]:
     """Provider config dict from defaults."""
     return _DEFAULTS["providers"].get(pid, {})
 
+# Maps model family → vendor prefix used by aggregator APIs (OpenRouter, Nous)
+_VENDOR_TO_HERMES: dict[str, str] = {
+    "anthropic": "anthropic",
+    "openai":    "openai",
+    "google":    "google",
+    "other":     "openai",
+}
+
 def to_hermes_model(pid: str, mid: str) -> str:
-    """Convert bhoga provider+model to Hermes `provider/model` string."""
+    """Convert bhoga provider+model to a correctly-normalised Hermes model string.
+
+    Normalisation rules (per hermes-agent ``model_normalize.py``):
+
+    - ``openrouter``: ``vendor/model`` with dots preserved, e.g. ``anthropic/claude-sonnet-4.6``
+    - ``anthropic`` (direct API): bare name, dots → hyphens, e.g. ``claude-sonnet-4-6``
+    - ``copilot``: bare name, dots preserved, e.g. ``claude-sonnet-4.6``
+    - ``openai-codex``: bare name, e.g. ``gpt-5.4``
+    """
     hp = _DEFAULTS["hermes_provider"].get(pid, "openrouter")
-    return f"{hp}/{mid}"
+    # Strip any existing vendor prefix (e.g. "anthropic/claude-opus-4" → "claude-opus-4")
+    bare = mid.split("/")[-1]
+    if hp == "openrouter":
+        vendor = _VENDOR_TO_HERMES.get(model_family(mid), "openai")
+        return f"{vendor}/{bare}"
+    if hp == "anthropic":
+        # Anthropic native API: dots → hyphens
+        return bare.replace(".", "-")
+    if hp in ("copilot", "openai-codex"):
+        # Bare name, dots preserved
+        return bare
+    return bare
 
 # ── Dataclasses ──────────────────────────────────────────────────────────────
 
@@ -345,16 +393,29 @@ def fetch_models(pid: str) -> list[str]:
     """List model IDs available from a provider's API."""
     c = cfg(pid)
     url = c.get("models_url")
-    auth_env = c.get("auth_env", "")
     if not url:
         return []
-    key = os.environ.get(auth_env, "")
+
+    # Resolve API key — Copilot uses a priority env var chain
+    if pid == "github-copilot":
+        key = (os.environ.get("COPILOT_GITHUB_TOKEN")
+               or os.environ.get("GH_TOKEN")
+               or os.environ.get("GITHUB_TOKEN", ""))
+    else:
+        auth_env = c.get("auth_env", "")
+        key = os.environ.get(auth_env, "")
+
     if not key:
         return []
+
     headers: dict[str, str] = {}
     if pid == "github-copilot":
-        headers = {"Authorization": f"Bearer {key}",
-                    "X-GitHub-Api-Version": "2026-03-10"}
+        # Required headers per hermes-agent copilot_auth.py + hermes_cli/models.py
+        headers = {
+            "Authorization": f"Bearer {key}",
+            "Editor-Version": "vscode/1.104.1",
+            "X-GitHub-Api-Version": "2022-11-28",
+        }
     elif pid == "anthropic_api":
         headers = {"x-api-key": key, "anthropic-version": "2023-06-01"}
     else:
@@ -366,7 +427,9 @@ def fetch_models(pid: str) -> list[str]:
         # OpenAI / Anthropic: {"data": [{"id": ...}]}
         if isinstance(data, dict) and "data" in data:
             return [m["id"] for m in data["data"] if "id" in m]
-        # GitHub Models: [{"id": ...}]
+        # Copilot models endpoint: [{"id": ...}] or {"models": [{"id": ...}]}
+        if isinstance(data, dict) and "models" in data:
+            return [m["id"] for m in data["models"] if "id" in m]
         if isinstance(data, list):
             return [m["id"] for m in data if "id" in m]
     except Exception as e:
@@ -470,7 +533,13 @@ def _parse_claude_cli() -> dict[str, QuotaWindow] | None:
 _CODEX_PCT_RE = re.compile(r"(\d+(?:\.\d+)?)\s*%\s*(used|left|remaining)", re.IGNORECASE)
 
 def parse_codex_quota() -> dict[str, QuotaWindow] | None:
-    """Parse Codex CLI /status output for dual-cadence windows."""
+    """Parse Codex CLI /status output for dual-cadence windows.
+
+    Tries JSON first (forward-compatible), then falls back to best-effort
+    text parse of the TUI status line (e.g. "gpt-5.4 high · 100% left · ~").
+    Weekly window is always UNKNOWN from the CLI — calibrate it via
+    ``Router.set_quota()`` or header calibration if you need precision.
+    """
     c = cfg("openai-codex")
     cmd = c.get("cli_cmd", ["codex", "--non-interactive", "/status"])
     try:
@@ -481,8 +550,32 @@ def parse_codex_quota() -> dict[str, QuotaWindow] | None:
     if not text:
         return None
 
+    # Try structured JSON first (forward-compatible for when Codex adds it)
+    try:
+        data = json.loads(text)
+        windows: dict[str, QuotaWindow] = {}
+        now = datetime.now(timezone.utc)
+        if "burst" in data or "five_hour" in data:
+            burst = data.get("burst") or data.get("five_hour", {})
+            # pct_used is 0-100; utilization is 0-1 → scale to 0-100
+            raw = burst.get("pct_used")
+            pct_used = float(raw) if raw is not None else float(burst.get("utilization", 0)) * 100.0
+            windows["burst"] = QuotaWindow(name="burst", pct_used=pct_used,
+                                           window_min=300, updated_at=now)
+        if "weekly" in data or "seven_day" in data:
+            weekly = data.get("weekly") or data.get("seven_day", {})
+            raw = weekly.get("pct_used")
+            pct_used = float(raw) if raw is not None else float(weekly.get("utilization", 0)) * 100.0
+            windows["weekly"] = QuotaWindow(name="weekly", pct_used=pct_used,
+                                            window_min=10080, updated_at=now)
+        if windows:
+            return windows
+    except (json.JSONDecodeError, TypeError, KeyError):
+        pass
+
+    # Best-effort text parse — weekly window not available from CLI text output
     now = datetime.now(timezone.utc)
-    windows: dict[str, QuotaWindow] = {}
+    windows = {}
     for m in _CODEX_PCT_RE.finditer(text):
         pct_val = float(m.group(1))
         direction = m.group(2).lower()
@@ -505,6 +598,88 @@ def check_quota(pid: str) -> dict[str, QuotaWindow] | None:
         return parse_codex_quota()
     return None
 
+
+# Default Codex model list (from hermes-agent hermes_cli/codex_models.py)
+_CODEX_DEFAULT_MODELS: list[str] = [
+    "gpt-5.4-mini",
+    "gpt-5.4",
+    "gpt-5.3-codex",
+    "gpt-5.2-codex",
+    "gpt-5.1-codex-max",
+    "gpt-5.1-codex-mini",
+]
+
+
+def get_codex_models() -> list[str]:
+    """Return available Codex model IDs from local files or built-in defaults.
+
+    Resolution order (no network call required):
+
+    1. ``~/.codex/models_cache.json`` — written by Codex CLI on first run.
+       Skips models that are hidden or not supported in the API.
+    2. ``~/.codex/config.toml`` — the model the user has configured.
+    3. Built-in defaults (current Codex model line-up).
+
+    Use this as a lightweight way to discover Codex models without running
+    ``codex --non-interactive /status``.  Quota is tracked separately via
+    ``parse_codex_quota()`` or ``Router.set_quota()``.
+    """
+    c = cfg("openai-codex")
+    ordered: list[str] = []
+    seen: set[str] = set()
+
+    def _add(mid: str) -> None:
+        if mid and mid not in seen:
+            ordered.append(mid)
+            seen.add(mid)
+
+    # 1. models_cache.json
+    cache_path = Path(c.get("models_cache", "~/.codex/models_cache.json")).expanduser()
+    if cache_path.exists():
+        try:
+            raw = json.loads(cache_path.read_text())
+            entries = raw.get("models", []) if isinstance(raw, dict) else []
+            sortable = []
+            for item in entries:
+                if not isinstance(item, dict):
+                    continue
+                slug = item.get("slug", "").strip()
+                if not slug:
+                    continue
+                if item.get("supported_in_api") is False:
+                    continue
+                vis = item.get("visibility", "")
+                if isinstance(vis, str) and vis.strip().lower() in ("hide", "hidden"):
+                    continue
+                priority = item.get("priority")
+                rank = int(priority) if isinstance(priority, (int, float)) else 10_000
+                sortable.append((rank, slug))
+            sortable.sort()
+            for _, slug in sortable:
+                _add(slug)
+        except Exception as e:
+            log.debug("bhoga: get_codex_models cache read failed: %s", e)
+
+    # 2. config.toml default model
+    config_path = Path(c.get("models_config", "~/.codex/config.toml")).expanduser()
+    if config_path.exists():
+        try:
+            # tomllib is stdlib in Python 3.11+; ImportError is caught by the
+            # outer except, so get_codex_models() degrades gracefully on 3.10-.
+            import tomllib  # noqa: PLC0415
+            payload = tomllib.loads(config_path.read_text())
+            model = payload.get("model", "")
+            if isinstance(model, str) and model.strip():
+                _add(model.strip())
+        except Exception as e:
+            log.debug("bhoga: get_codex_models config read failed: %s", e)
+
+    # 3. Built-in defaults
+    for mid in _CODEX_DEFAULT_MODELS:
+        _add(mid)
+
+    return ordered
+
 # ── Router ───────────────────────────────────────────────────────────────────
 
 class Router:
@@ -515,6 +690,11 @@ class Router:
         self._path = ifnone(state_path, STATE_PATH)
         with self._lock:
             self._state: dict[str, ProviderQuota] = load_state(self._path)
+        # Single worker thread drains all record_turn calls serially — prevents
+        # unbounded thread spawning and eliminates per-turn TOCTOU races.
+        self._queue: queue.SimpleQueue = queue.SimpleQueue()
+        self._worker = threading.Thread(target=self._worker_loop, daemon=True)
+        self._worker.start()
         if eager:
             threading.Thread(target=self._init_bg, daemon=True).start()
 
@@ -537,8 +717,13 @@ class Router:
             self._state[self._key(q.provider_id, q.model_id)] = q
 
     def _save(self) -> None:
+        """Atomically persist state: snapshot under lock, then rename-replace."""
+        self._path.parent.mkdir(parents=True, exist_ok=True)
         with self._lock:
-            save_state(dict(self._state), self._path)
+            snapshot = {k: _ser(v) for k, v in self._state.items()}
+        tmp = self._path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(snapshot, indent=2))
+        tmp.rename(self._path)  # atomic on POSIX
 
     # ── background init ──────────────────────────────────────────────────
 
@@ -549,10 +734,12 @@ class Router:
             try:
                 windows = check_quota(pid)
                 if windows:
-                    q = self._get(pid, "*") or blank(pid)
-                    q.windows = windows
-                    q.recompute()
-                    self._put(q)
+                    with self._lock:
+                        key = self._key(pid, "*")
+                        q = self._state.get(key) or blank(pid, "*")
+                        q.windows = windows
+                        q.recompute()
+                        self._state[key] = q
             except Exception as e:
                 log.debug("bhoga: bg init %s failed: %s", pid, e)
 
@@ -575,12 +762,14 @@ class Router:
         """Pick the best provider for *model* based on live quota."""
         candidates: list[ProviderQuota] = []
         for pid in hierarchy_for(model):
-            q = self._get(pid, model)
-            if q is None:
-                # Create optimistic blank
-                q = blank(pid, model)
-                self._put(q)
-            q.reset_if_due()
+            # Atomic get-or-create + reset under a single lock acquisition
+            with self._lock:
+                key = self._key(pid, model)
+                q = self._state.get(key) or self._state.get(self._key(pid, "*"))
+                if q is None:
+                    q = blank(pid, model)
+                    self._state[key] = q
+                q.reset_if_due()
             if q.is_usable():
                 candidates.append(q)
 
@@ -604,19 +793,40 @@ class Router:
     def record_turn(self, pid: str, model: str, input_tokens: int = 0,
                     output_tokens: int = 0, headers: dict[str, str] | None = None,
                     status_code: int = 200) -> None:
-        """Record a completed API turn. Runs calibration in background."""
-        threading.Thread(
-            target=self._record_bg, daemon=True,
-            args=(pid, model, input_tokens, output_tokens, headers, status_code),
-        ).start()
+        """Record a completed API turn.
+
+        Non-blocking: enqueues the work item and returns immediately.
+        The single background worker serialises all writes, eliminating
+        TOCTOU races and unbounded thread creation.
+        """
+        self._queue.put((pid, model, input_tokens, output_tokens, headers, status_code))
+
+    def _worker_loop(self) -> None:
+        """Drain the record queue; runs on a single persistent daemon thread."""
+        while True:
+            item = self._queue.get()
+            if item is None:  # None is the shutdown sentinel
+                break
+            pid, model, inp, out, headers, status_code = item
+            self._record_bg(pid, model, inp, out, headers, status_code)
 
     def _record_bg(self, pid: str, model: str, inp: int, out: int,
                    headers: dict[str, str] | None, status_code: int) -> None:
-        q = self._get(pid, model)
-        if q is None:
-            q = blank(pid, model)
-        q.consumed += inp + out
-        q.n_requests += 1
+        """Called only from the worker thread — no concurrent invocations."""
+        with self._lock:
+            key = self._key(pid, model)
+            q = (self._state.get(key)
+                 or self._state.get(self._key(pid, "*"))
+                 or blank(pid, model))
+            # Shallow-copy scalar fields before releasing lock so calibrate/
+            # mark_throttled can run without holding it.  ProviderQuota only has
+            # scalar fields + the windows dict; QuotaWindow itself has only
+            # scalar fields — so shallow copy is safe here.
+            q = copy.copy(q)
+            q.windows = dict(q.windows)   # copy the mapping (values stay shared)
+            q.consumed += inp + out
+            q.n_requests += 1
+
         if headers:
             calibrate(q, headers)
         if status_code == 429:
@@ -624,7 +834,84 @@ class Router:
             mark_throttled(q, retry_after)
         else:
             q.recompute()
-        self._put(q)
+
+        with self._lock:
+            self._state[self._key(pid, model)] = q
+        self._save()
+
+    # ── manual quota override ─────────────────────────────────────────────
+
+    def set_quota(self, pid: str, pct_remaining: float,
+                  weekly_pct: float | None = None,
+                  model: str = "*") -> None:
+        """Manually set the remaining quota for a provider.
+
+        Use this as a fallback when automatic discovery is unavailable —
+        for example when Codex CLI is not installed, when running in CI, or
+        when the user already knows their current quota state.
+
+        Args:
+            pid:           Provider ID — "claude_code", "openai-codex", or
+                           "github-copilot" (also works for "anthropic_api" /
+                           "openai_api").
+            pct_remaining: Percentage of quota remaining [0 .. 100].
+                           For windowed providers this sets the *burst* window.
+            weekly_pct:    Optional separate weekly-window remaining percentage.
+                           Only meaningful for "claude_code" and "openai-codex".
+                           Defaults to *pct_remaining* when omitted.
+            model:         Model key to associate with (default ``"*"`` = all
+                           models for this provider).
+
+        Examples::
+
+            router.set_quota("openai-codex", pct_remaining=75.0)
+            router.set_quota("claude_code",  pct_remaining=90.0, weekly_pct=60.0)
+            router.set_quota("github-copilot", pct_remaining=85.0)
+        """
+        if not (0.0 <= pct_remaining <= 100.0):
+            raise ValueError(f"pct_remaining must be 0–100, got {pct_remaining}")
+        if weekly_pct is not None and not (0.0 <= weekly_pct <= 100.0):
+            raise ValueError(f"weekly_pct must be 0–100, got {weekly_pct}")
+
+        now = datetime.now(timezone.utc)
+        c = cfg(pid)
+
+        with self._lock:
+            key = self._key(pid, model)
+            q = self._state.get(key) or blank(pid, model)
+            q = copy.copy(q)
+            q.windows = dict(q.windows)
+
+            if c.get("windows"):
+                # Window-based provider (claude_code, openai-codex)
+                wcfg = c["windows"]
+                burst_min  = wcfg.get("burst",  {}).get("default_minutes", 300)
+                weekly_min = wcfg.get("weekly", {}).get("default_minutes", 10080)
+
+                burst_win = q.windows.get("burst") or QuotaWindow(
+                    name="burst", window_min=burst_min)
+                burst_win = copy.copy(burst_win)
+                burst_win.pct_used  = 100.0 - pct_remaining
+                burst_win.updated_at = now
+                q.windows["burst"] = burst_win
+
+                if "weekly" in wcfg:
+                    weekly_win = q.windows.get("weekly") or QuotaWindow(
+                        name="weekly", window_min=weekly_min)
+                    weekly_win = copy.copy(weekly_win)
+                    weekly_win.pct_used  = 100.0 - (
+                        weekly_pct if weekly_pct is not None else pct_remaining)
+                    weekly_win.updated_at = now
+                    q.windows["weekly"] = weekly_win
+            else:
+                # Token/request-based provider (anthropic_api, openai_api, github-copilot)
+                ceiling = q.ceiling or 1_000_000
+                q.calibrated    = int(ceiling * pct_remaining / 100.0)
+                q.calibrated_at = now
+
+            q.recompute()
+            self._state[key] = q
+
         self._save()
 
     # ── introspection ────────────────────────────────────────────────────
@@ -636,11 +923,23 @@ class Router:
 # ── Hermes integration ───────────────────────────────────────────────────────
 
 def apply_to_hermes(router: Router, model: str,
-                    config_path: str | Path | None = None) -> bool:
+                    config_path: str | Path | None = None,
+                    write_auxiliary: bool = False) -> bool:
     """Write the best provider for *model* into Hermes config.yaml.
 
-    Updates ``model``, ``compression.summary_provider``, and auxiliary
-    provider fields to use the recommended bhoga provider.
+    Always updates:
+
+    - ``model`` — written as a dict ``{default, provider, api_mode}`` so
+      Hermes picks up the correct wire protocol automatically (e.g.
+      ``codex_responses`` for ``openai-codex``, ``anthropic_messages``
+      for the Anthropic direct API).
+    - ``compression.summary_provider`` — keeps summarisation in sync.
+
+    Optionally (``write_auxiliary=True``) also overwrites all auxiliary
+    task providers (vision, web_extract, compression, …).
+
+    For GitHub Copilot, writes a non-destructive ``providers.copilot``
+    stub so Hermes knows the base URL and auth env var.
 
     Returns True if config was written, False on failure.
     """
@@ -655,21 +954,37 @@ def apply_to_hermes(router: Router, model: str,
     else:
         config = {}
 
-    hermes_pid = _DEFAULTS["hermes_provider"].get(rec.provider_id, "openrouter")
+    hermes_pid  = _DEFAULTS["hermes_provider"].get(rec.provider_id, "openrouter")
+    api_mode    = _DEFAULTS["hermes_api_mode"].get(hermes_pid, "chat_completions")
+    hermes_name = to_hermes_model(rec.provider_id, model)
 
-    # Set main model
-    config["model"] = rec.hermes_model
+    # Write model as a structured dict so Hermes gets provider + api_mode too
+    config["model"] = {
+        "default":  hermes_name,
+        "provider": hermes_pid,
+        "api_mode": api_mode,
+    }
 
-    # Set compression summary provider
-    compression = config.setdefault("compression", {})
-    compression["summary_provider"] = hermes_pid
+    # Always keep compression in sync
+    config.setdefault("compression", {})["summary_provider"] = hermes_pid
 
-    # Set auxiliary providers
-    auxiliary = config.setdefault("auxiliary", {})
-    for task in ("vision", "web_extract", "compression", "session_search",
-                 "skills_hub", "approval", "mcp", "flush_memories"):
-        task_cfg = auxiliary.setdefault(task, {})
-        task_cfg["provider"] = hermes_pid
+    # Optional: overwrite all auxiliary task providers
+    if write_auxiliary:
+        auxiliary = config.setdefault("auxiliary", {})
+        for task in ("vision", "web_extract", "compression", "session_search",
+                     "skills_hub", "approval", "mcp", "flush_memories"):
+            auxiliary.setdefault(task, {})["provider"] = hermes_pid
+
+    # Non-destructive Copilot provider stub (Hermes canonical key: "copilot")
+    if rec.provider_id == "github-copilot":
+        providers = config.setdefault("providers", {})
+        if "copilot" not in providers:
+            providers["copilot"] = {
+                "type":        "openai_compatible",
+                "base_url":    cfg("github-copilot").get("base_url",
+                                   "https://api.githubcopilot.com"),
+                "api_key_env": "COPILOT_GITHUB_TOKEN",
+            }
 
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(yaml.dump(config, default_flow_style=False, sort_keys=False))
