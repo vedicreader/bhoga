@@ -8,9 +8,9 @@ Design: fastai/fastcore style — succinct, annotated, no ceremony.
 """
 from __future__ import annotations
 
-import copy, json, logging, os, queue, re, subprocess, threading, time
+import copy, json, logging, os, queue, re, subprocess, threading
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from enum import StrEnum, auto
 from pathlib import Path
 from typing import Any
@@ -18,7 +18,7 @@ from typing import Any
 import httpx
 import yaml
 from dateutil.parser import parse as dt_parse
-from fastcore.basics import ifnone, store_attr
+from fastcore.basics import basic_repr, ifnone, store_attr, uniqueify
 
 log = logging.getLogger(__name__)
 
@@ -139,15 +139,15 @@ STATE_PATH = Path(os.environ.get("BHOGA_STATE", Path.home() / ".cache" / "bhoga"
 # ── Provider helpers ─────────────────────────────────────────────────────────
 
 def model_family(m: str) -> str:
-    """Map a model name to its family via prefix match."""
+    "Map a model name to its family via prefix match."
     return next((f for p, f in _FAM.items() if m.lower().startswith(p)), "other")
 
 def hierarchy_for(model: str) -> list[str]:
-    """Ordered provider IDs to try for *model*."""
+    "Ordered provider IDs to try for *model*; unknown families fall back to 'other' (github-copilot)."
     return list(_DEFAULTS["hierarchy"].get(model_family(model), _DEFAULTS["hierarchy"]["other"]))
 
 def cfg(pid: str) -> dict[str, Any]:
-    """Provider config dict from defaults."""
+    "Provider config dict from defaults."
     return _DEFAULTS["providers"].get(pid, {})
 
 # Maps model family → vendor prefix used by aggregator APIs (OpenRouter, Nous)
@@ -186,7 +186,7 @@ def to_hermes_model(pid: str, mid: str) -> str:
 
 @dataclass
 class QuotaWindow:
-    """One rate-limit window (e.g., 5h burst or 7d weekly)."""
+    "One rate-limit window (e.g., 5h burst or 7d weekly)."
     name:       str
     pct_used:   float              = 0.0
     resets_at:  datetime | None    = None
@@ -194,13 +194,12 @@ class QuotaWindow:
     updated_at: datetime | None    = None
 
     @property
-    def pct_remaining(self) -> float:
-        return max(0.0, 100.0 - self.pct_used)
+    def pct_remaining(self) -> float: return max(0.0, 100.0 - self.pct_used)
 
 
 @dataclass
 class ProviderQuota:
-    """Tracks quota for one provider×model pair."""
+    "Tracks quota for one provider×model pair."
     provider_id:   str
     model_id:      str
     plan:          str              = "unknown"
@@ -215,10 +214,11 @@ class ProviderQuota:
     backoff_until: datetime | None  = None
     priority:      int              = 99
     windows:       dict[str, QuotaWindow] = field(default_factory=dict)
+    __repr__       = basic_repr('provider_id,model_id,status,quota_pct')
 
     @property
     def quota_pct(self) -> float:
-        """Remaining quota as fraction [0,1]. -1 = unknown."""
+        "Remaining quota as fraction [0,1]. -1 = unknown."
         if self.windows:
             updated = [w.pct_remaining for w in self.windows.values() if w.updated_at]
             return min(updated) / 100.0 if updated else -1.0
@@ -230,42 +230,35 @@ class ProviderQuota:
 
     def is_usable(self) -> bool:
         now = datetime.now(timezone.utc)
-        if self.backoff_until and now < self.backoff_until:
-            return False
+        if self.backoff_until and now < self.backoff_until: return False
         return self.status not in (ProviderStatus.EXHAUSTED, ProviderStatus.THROTTLED)
 
     def recompute(self) -> None:
-        """Derive status from current quota numbers."""
+        "Derive status from current quota numbers."
         pct = self.quota_pct
-        if pct < 0:
-            self.status = ProviderStatus.UNKNOWN
-        elif pct <= 0.0:
-            self.status = ProviderStatus.EXHAUSTED
-        elif pct < 0.10:
-            self.status = ProviderStatus.LOW
-        else:
-            self.status = ProviderStatus.OK
+        if pct < 0:       self.status = ProviderStatus.UNKNOWN
+        elif pct <= 0.0:  self.status = ProviderStatus.EXHAUSTED
+        elif pct < 0.10:  self.status = ProviderStatus.LOW
+        else:             self.status = ProviderStatus.OK
 
-    def reset_if_due(self) -> None:
-        """Reset counters if cadence window has elapsed."""
+    def reset_if_due(self) -> bool:
+        "Reset counters if cadence window has elapsed; returns True if any reset fired."
         now = datetime.now(timezone.utc)
-        # Window-based providers: reset individual windows
+        reset = False
         for w in self.windows.values():
             if w.resets_at and now >= w.resets_at:
-                w.pct_used = 0.0
-                w.resets_at = None
-                w.updated_at = now
-        # Token-based providers: reset consumed
+                w.pct_used, w.resets_at, w.updated_at = 0.0, None, now
+                reset = True
         if self.reset_at and now >= self.reset_at:
-            self.consumed = 0
-            self.calibrated = self.ceiling
-            self.reset_at = None
+            self.consumed, self.calibrated, self.reset_at = 0, self.ceiling, None
+            reset = True
         self.recompute()
+        return reset
 
 
 @dataclass
 class RouterRecommendation:
-    """What `best_for()` returns."""
+    "What `best_for()` returns."
     provider_id:  str
     model_id:     str
     quota_pct:    float
@@ -275,7 +268,7 @@ class RouterRecommendation:
 
 
 def blank(pid: str, mid: str = "*") -> ProviderQuota:
-    """Create a fresh ProviderQuota with defaults from config."""
+    "Create a fresh ProviderQuota with defaults from config."
     c = cfg(pid)
     cadence = BillingCadence(c.get("cadence", "monthly"))
     windows: dict[str, QuotaWindow] = {}
@@ -288,15 +281,12 @@ def blank(pid: str, mid: str = "*") -> ProviderQuota:
 
 # ── Serialization ────────────────────────────────────────────────────────────
 
-def _ser_dt(dt: datetime | None) -> str | None:
-    return dt.isoformat() if dt else None
-
-def _deser_dt(s: str | None) -> datetime | None:
-    return dt_parse(s) if s else None
+_ser_dt   = lambda dt: dt.isoformat() if dt else None
+_deser_dt = lambda s:  dt_parse(s) if s else None
 
 def _ser_window(w: QuotaWindow) -> dict:
-    return {"name": w.name, "pct_used": w.pct_used, "window_min": w.window_min,
-            "resets_at": _ser_dt(w.resets_at), "updated_at": _ser_dt(w.updated_at)}
+    return dict(name=w.name, pct_used=w.pct_used, window_min=w.window_min,
+                resets_at=_ser_dt(w.resets_at), updated_at=_ser_dt(w.updated_at))
 
 def _deser_window(d: dict) -> QuotaWindow:
     return QuotaWindow(name=d["name"], pct_used=d.get("pct_used", 0.0),
@@ -305,15 +295,13 @@ def _deser_window(d: dict) -> QuotaWindow:
                        updated_at=_deser_dt(d.get("updated_at")))
 
 def _ser(q: ProviderQuota) -> dict:
-    return {
-        "provider_id": q.provider_id, "model_id": q.model_id, "plan": q.plan,
-        "ceiling": q.ceiling, "cadence": q.cadence.value, "consumed": q.consumed,
-        "n_requests": q.n_requests, "calibrated": q.calibrated, "priority": q.priority,
-        "status": q.status.value,
-        "reset_at": _ser_dt(q.reset_at), "calibrated_at": _ser_dt(q.calibrated_at),
-        "backoff_until": _ser_dt(q.backoff_until),
-        "windows": {k: _ser_window(v) for k, v in q.windows.items()},
-    }
+    return dict(provider_id=q.provider_id, model_id=q.model_id, plan=q.plan,
+                ceiling=q.ceiling, cadence=q.cadence.value, consumed=q.consumed,
+                n_requests=q.n_requests, calibrated=q.calibrated, priority=q.priority,
+                status=q.status.value,
+                reset_at=_ser_dt(q.reset_at), calibrated_at=_ser_dt(q.calibrated_at),
+                backoff_until=_ser_dt(q.backoff_until),
+                windows={k: _ser_window(v) for k, v in q.windows.items()})
 
 def _deser(d: dict) -> ProviderQuota:
     return ProviderQuota(
@@ -346,7 +334,7 @@ def load_state(path: Path = STATE_PATH) -> dict[str, ProviderQuota]:
 # ── Header calibration ───────────────────────────────────────────────────────
 
 def calibrate(q: ProviderQuota, headers: dict[str, str]) -> ProviderQuota:
-    """Update quota from HTTP response headers."""
+    "Update quota from HTTP response headers."
     c = cfg(q.provider_id)
     hdr_rem = c.get("hdr_rem", "")
     hdr_limit = c.get("hdr_limit", "")
@@ -380,38 +368,33 @@ def calibrate(q: ProviderQuota, headers: dict[str, str]) -> ProviderQuota:
 
 
 def mark_throttled(q: ProviderQuota, retry_after: float = 60.0) -> ProviderQuota:
-    """Mark provider as throttled (e.g., on 429)."""
-    now = datetime.now(timezone.utc)
-    from datetime import timedelta
+    "Mark provider as throttled (e.g., on 429)."
     q.status = ProviderStatus.THROTTLED
-    q.backoff_until = now + timedelta(seconds=retry_after)
+    q.backoff_until = datetime.now(timezone.utc) + timedelta(seconds=retry_after)
     return q
 
 # ── Quota discovery ──────────────────────────────────────────────────────────
 
+def _resolve_token(pid: str) -> str:
+    "Resolve API key for a provider; uses fallback env-var chain for Copilot."
+    if pid == "github-copilot":
+        return (os.environ.get("COPILOT_GITHUB_TOKEN")
+                or os.environ.get("GH_TOKEN")
+                or os.environ.get("GITHUB_TOKEN", ""))
+    return os.environ.get(cfg(pid).get("auth_env", ""), "")
+
 def fetch_models(pid: str) -> list[str]:
-    """List model IDs available from a provider's API."""
+    "List model IDs available from a provider's API."
     c = cfg(pid)
     url = c.get("models_url")
-    if not url:
-        return []
+    if not url: return []
 
-    # Resolve API key — Copilot uses a priority env var chain
-    if pid == "github-copilot":
-        key = (os.environ.get("COPILOT_GITHUB_TOKEN")
-               or os.environ.get("GH_TOKEN")
-               or os.environ.get("GITHUB_TOKEN", ""))
-    else:
-        auth_env = c.get("auth_env", "")
-        key = os.environ.get(auth_env, "")
+    key = _resolve_token(pid)
+    if not key: return []
 
-    if not key:
-        return []
-
-    headers: dict[str, str] = {}
     if pid == "github-copilot":
         # Required headers per hermes-agent copilot_auth.py + hermes_cli/models.py
-        headers = {
+        headers: dict[str, str] = {
             "Authorization": f"Bearer {key}",
             "Editor-Version": "vscode/1.104.1",
             "X-GitHub-Api-Version": "2022-11-28",
@@ -438,7 +421,7 @@ def fetch_models(pid: str) -> list[str]:
 
 
 def parse_claude_quota() -> dict[str, QuotaWindow] | None:
-    """Read Claude Code quota from OAuth API or CLI fallback. Returns windows dict or None."""
+    "Read Claude Code quota from OAuth API or CLI fallback. Returns windows dict or None."
     # Try OAuth API first
     cred_path = Path(cfg("claude_code").get("cred_path", "~/.claude/.credentials.json")).expanduser()
     token = _read_claude_token(cred_path)
@@ -466,7 +449,7 @@ def _read_claude_token(cred_path: Path) -> str | None:
 
 
 def _fetch_claude_oauth(token: str) -> dict[str, QuotaWindow] | None:
-    """Fetch structured quota from Anthropic OAuth usage API."""
+    "Fetch structured quota from Anthropic OAuth usage API."
     url = cfg("claude_code").get("oauth_url", "https://api.anthropic.com/api/oauth/usage")
     now = datetime.now(timezone.utc)
     try:
@@ -497,11 +480,10 @@ def _fetch_claude_oauth(token: str) -> dict[str, QuotaWindow] | None:
     return windows if windows else None
 
 
-_CLAUDE_PCT_RE = re.compile(r"(\d+(?:\.\d+)?)\s*%\s*(used|left|remaining)", re.IGNORECASE)
-_CLAUDE_WINDOW_RE = re.compile(r"(session|5.?h(?:our)?|burst|week|7.?d(?:ay)?)", re.IGNORECASE)
+_PCT_RE = re.compile(r"(\d+(?:\.\d+)?)\s*%\s*(used|left|remaining)", re.IGNORECASE)
 
 def _parse_claude_cli() -> dict[str, QuotaWindow] | None:
-    """Fallback: parse `claude /usage` stdout."""
+    "Fallback: parse `claude /usage` stdout."
     try:
         result = subprocess.run(
             ["claude", "-p", "/usage"], capture_output=True, text=True, timeout=30,
@@ -509,13 +491,12 @@ def _parse_claude_cli() -> dict[str, QuotaWindow] | None:
         text = result.stdout
     except Exception:
         return None
-    if not text:
-        return None
+    if not text: return None
 
     now = datetime.now(timezone.utc)
     windows: dict[str, QuotaWindow] = {}
     # Look for percentage patterns near window labels
-    for m in _CLAUDE_PCT_RE.finditer(text):
+    for m in _PCT_RE.finditer(text):
         pct_val = float(m.group(1))
         direction = m.group(2).lower()
         pct_used = pct_val if "used" in direction else (100.0 - pct_val)
@@ -530,7 +511,7 @@ def _parse_claude_cli() -> dict[str, QuotaWindow] | None:
     return windows if windows else None
 
 
-_CODEX_PCT_RE = re.compile(r"(\d+(?:\.\d+)?)\s*%\s*(used|left|remaining)", re.IGNORECASE)
+_CODEX_PCT_RE = _PCT_RE  # alias kept for any external callers
 
 def parse_codex_quota() -> dict[str, QuotaWindow] | None:
     """Parse Codex CLI /status output for dual-cadence windows.
@@ -547,8 +528,7 @@ def parse_codex_quota() -> dict[str, QuotaWindow] | None:
         text = result.stdout
     except Exception:
         return None
-    if not text:
-        return None
+    if not text: return None
 
     # Try structured JSON first (forward-compatible for when Codex adds it)
     try:
@@ -568,15 +548,14 @@ def parse_codex_quota() -> dict[str, QuotaWindow] | None:
             pct_used = float(raw) if raw is not None else float(weekly.get("utilization", 0)) * 100.0
             windows["weekly"] = QuotaWindow(name="weekly", pct_used=pct_used,
                                             window_min=10080, updated_at=now)
-        if windows:
-            return windows
+        if windows: return windows
     except (json.JSONDecodeError, TypeError, KeyError):
         pass
 
     # Best-effort text parse — weekly window not available from CLI text output
     now = datetime.now(timezone.utc)
     windows = {}
-    for m in _CODEX_PCT_RE.finditer(text):
+    for m in _PCT_RE.finditer(text):
         pct_val = float(m.group(1))
         direction = m.group(2).lower()
         pct_used = pct_val if "used" in direction else (100.0 - pct_val)
@@ -590,13 +569,16 @@ def parse_codex_quota() -> dict[str, QuotaWindow] | None:
     return windows if windows else None
 
 
+# Table-driven dispatch: add new subscription providers here without touching check_quota.
+_QUOTA_FINDERS: dict[str, Any] = {
+    "claude_code":  parse_claude_quota,
+    "openai-codex": parse_codex_quota,
+}
+
 def check_quota(pid: str) -> dict[str, QuotaWindow] | None:
-    """Dispatch quota check for subscription-based providers."""
-    if pid == "claude_code":
-        return parse_claude_quota()
-    if pid == "openai-codex":
-        return parse_codex_quota()
-    return None
+    "Dispatch quota check for subscription-based providers."
+    finder = _QUOTA_FINDERS.get(pid)
+    return finder() if finder else None
 
 
 # Default Codex model list (from hermes-agent hermes_cli/codex_models.py)
@@ -625,13 +607,7 @@ def get_codex_models() -> list[str]:
     ``parse_codex_quota()`` or ``Router.set_quota()``.
     """
     c = cfg("openai-codex")
-    ordered: list[str] = []
-    seen: set[str] = set()
-
-    def _add(mid: str) -> None:
-        if mid and mid not in seen:
-            ordered.append(mid)
-            seen.add(mid)
+    candidates: list[str] = []
 
     # 1. models_cache.json
     cache_path = Path(c.get("models_cache", "~/.codex/models_cache.json")).expanduser()
@@ -641,22 +617,17 @@ def get_codex_models() -> list[str]:
             entries = raw.get("models", []) if isinstance(raw, dict) else []
             sortable = []
             for item in entries:
-                if not isinstance(item, dict):
-                    continue
+                if not isinstance(item, dict): continue
                 slug = item.get("slug", "").strip()
-                if not slug:
-                    continue
-                if item.get("supported_in_api") is False:
-                    continue
+                if not slug: continue
+                if item.get("supported_in_api") is False: continue
                 vis = item.get("visibility", "")
-                if isinstance(vis, str) and vis.strip().lower() in ("hide", "hidden"):
-                    continue
+                if isinstance(vis, str) and vis.strip().lower() in ("hide", "hidden"): continue
                 priority = item.get("priority")
                 rank = int(priority) if isinstance(priority, (int, float)) else 10_000
                 sortable.append((rank, slug))
             sortable.sort()
-            for _, slug in sortable:
-                _add(slug)
+            candidates.extend(slug for _, slug in sortable)
         except Exception as e:
             log.debug("bhoga: get_codex_models cache read failed: %s", e)
 
@@ -670,24 +641,24 @@ def get_codex_models() -> list[str]:
             payload = tomllib.loads(config_path.read_text())
             model = payload.get("model", "")
             if isinstance(model, str) and model.strip():
-                _add(model.strip())
+                candidates.append(model.strip())
         except Exception as e:
             log.debug("bhoga: get_codex_models config read failed: %s", e)
 
     # 3. Built-in defaults
-    for mid in _CODEX_DEFAULT_MODELS:
-        _add(mid)
+    candidates.extend(_CODEX_DEFAULT_MODELS)
 
-    return ordered
+    return uniqueify([m for m in candidates if m])
 
 # ── Router ───────────────────────────────────────────────────────────────────
 
 class Router:
-    """Stateful provider router.  Thread-safe, background-init, no LLM dependency."""
+    "Stateful provider router.  Thread-safe, background-init, no LLM dependency."
 
     def __init__(self, *, state_path: Path | None = None, eager: bool = True):
-        self._lock = threading.Lock()
-        self._path = ifnone(state_path, STATE_PATH)
+        self._lock  = threading.Lock()
+        self._path  = ifnone(state_path, STATE_PATH)
+        self._ready = threading.Event()  # set when _init_bg completes
         with self._lock:
             self._state: dict[str, ProviderQuota] = load_state(self._path)
         # Single worker thread drains all record_turn calls serially — prevents
@@ -697,19 +668,19 @@ class Router:
         self._worker.start()
         if eager:
             threading.Thread(target=self._init_bg, daemon=True).start()
+        else:
+            self._ready.set()  # no background init; mark ready immediately
 
     # ── key helpers ──────────────────────────────────────────────────────
 
     @staticmethod
-    def _key(pid: str, mid: str) -> str:
-        return f"{pid}:{mid}"
+    def _key(pid: str, mid: str) -> str: return f"{pid}:{mid}"
 
     def _get(self, pid: str, mid: str) -> ProviderQuota | None:
-        """Look up quota: exact match, then wildcard fallback."""
+        "Look up quota: exact match, then wildcard fallback."
         with self._lock:
             q = self._state.get(self._key(pid, mid))
-            if q is None:
-                q = self._state.get(self._key(pid, "*"))
+            if q is None: q = self._state.get(self._key(pid, "*"))
             return q
 
     def _put(self, q: ProviderQuota) -> None:
@@ -717,7 +688,7 @@ class Router:
             self._state[self._key(q.provider_id, q.model_id)] = q
 
     def _save(self) -> None:
-        """Atomically persist state: snapshot under lock, then rename-replace."""
+        "Atomically persist state: snapshot under lock, then rename-replace."
         self._path.parent.mkdir(parents=True, exist_ok=True)
         with self._lock:
             snapshot = {k: _ser(v) for k, v in self._state.items()}
@@ -728,7 +699,7 @@ class Router:
     # ── background init ──────────────────────────────────────────────────
 
     def _init_bg(self) -> None:
-        """Discover models and subscription quotas in background."""
+        "Discover models and subscription quotas in background."
         # Subscription providers: check quota windows
         for pid in ("claude_code", "openai-codex"):
             try:
@@ -755,12 +726,14 @@ class Router:
             except Exception as e:
                 log.debug("bhoga: bg init %s failed: %s", pid, e)
         self._save()
+        self._ready.set()
 
     # ── routing ──────────────────────────────────────────────────────────
 
     def best_for(self, model: str) -> RouterRecommendation | None:
-        """Pick the best provider for *model* based on live quota."""
+        "Pick the best provider for *model* based on live quota."
         candidates: list[ProviderQuota] = []
+        did_reset = False
         for pid in hierarchy_for(model):
             # Atomic get-or-create + reset under a single lock acquisition
             with self._lock:
@@ -769,12 +742,11 @@ class Router:
                 if q is None:
                     q = blank(pid, model)
                     self._state[key] = q
-                q.reset_if_due()
-            if q.is_usable():
-                candidates.append(q)
+                if q.reset_if_due(): did_reset = True
+            if q.is_usable(): candidates.append(q)
+        if did_reset: self._save()
 
-        if not candidates:
-            return None
+        if not candidates: return None
 
         # Sort: highest remaining quota first, priority breaks ties (lower = better)
         candidates.sort(key=lambda q: (q.quota_pct, -q.priority), reverse=True)
@@ -802,33 +774,30 @@ class Router:
         self._queue.put((pid, model, input_tokens, output_tokens, headers, status_code))
 
     def _worker_loop(self) -> None:
-        """Drain the record queue; runs on a single persistent daemon thread."""
+        "Drain the record queue; runs on a single persistent daemon thread."
         while True:
             item = self._queue.get()
-            if item is None:  # None is the shutdown sentinel
-                break
+            if item is None: break  # None is the shutdown sentinel
             pid, model, inp, out, headers, status_code = item
             self._record_bg(pid, model, inp, out, headers, status_code)
 
     def _record_bg(self, pid: str, model: str, inp: int, out: int,
                    headers: dict[str, str] | None, status_code: int) -> None:
-        """Called only from the worker thread — no concurrent invocations."""
+        "Called only from the worker thread — no concurrent invocations."
         with self._lock:
             key = self._key(pid, model)
             q = (self._state.get(key)
                  or self._state.get(self._key(pid, "*"))
                  or blank(pid, model))
-            # Shallow-copy scalar fields before releasing lock so calibrate/
-            # mark_throttled can run without holding it.  ProviderQuota only has
-            # scalar fields + the windows dict; QuotaWindow itself has only
-            # scalar fields — so shallow copy is safe here.
+            # calibrate/mark_throttled only mutate scalar fields on q;
+            # QuotaWindow values are not modified by those helpers, so the
+            # shallow copy of the windows mapping is safe here.
             q = copy.copy(q)
             q.windows = dict(q.windows)   # copy the mapping (values stay shared)
             q.consumed += inp + out
             q.n_requests += 1
 
-        if headers:
-            calibrate(q, headers)
+        if headers: calibrate(q, headers)
         if status_code == 429:
             retry_after = float((headers or {}).get("retry-after", "60"))
             mark_throttled(q, retry_after)
@@ -914,13 +883,29 @@ class Router:
 
         self._save()
 
+    # ── lifecycle ────────────────────────────────────────────────────────
+
+    def close(self) -> None:
+        "Flush the record queue and stop the worker thread gracefully."
+        if self._worker.is_alive():
+            self._queue.put(None)
+            self._worker.join()
+
+    def __del__(self) -> None:
+        try: self.close()
+        except Exception as e: log.debug("bhoga: Router.__del__ close failed: %s", e)
+
     # ── introspection ────────────────────────────────────────────────────
 
     def quotas(self) -> dict[str, ProviderQuota]:
-        with self._lock:
-            return dict(self._state)
+        with self._lock: return dict(self._state)
 
 # ── Hermes integration ───────────────────────────────────────────────────────
+
+_HERMES_AUX_TASKS = (
+    "vision", "web_extract", "compression", "session_search",
+    "skills_hub", "approval", "mcp", "flush_memories",
+)
 
 def apply_to_hermes(router: Router, model: str,
                     config_path: str | Path | None = None,
@@ -949,21 +934,14 @@ def apply_to_hermes(router: Router, model: str,
         return False
 
     path = Path(ifnone(config_path, Path.home() / ".hermes" / "config.yaml"))
-    if path.exists():
-        config = yaml.safe_load(path.read_text()) or {}
-    else:
-        config = {}
+    config = yaml.safe_load(path.read_text()) or {} if path.exists() else {}
 
     hermes_pid  = _DEFAULTS["hermes_provider"].get(rec.provider_id, "openrouter")
     api_mode    = _DEFAULTS["hermes_api_mode"].get(hermes_pid, "chat_completions")
     hermes_name = to_hermes_model(rec.provider_id, model)
 
     # Write model as a structured dict so Hermes gets provider + api_mode too
-    config["model"] = {
-        "default":  hermes_name,
-        "provider": hermes_pid,
-        "api_mode": api_mode,
-    }
+    config["model"] = dict(default=hermes_name, provider=hermes_pid, api_mode=api_mode)
 
     # Always keep compression in sync
     config.setdefault("compression", {})["summary_provider"] = hermes_pid
@@ -971,8 +949,7 @@ def apply_to_hermes(router: Router, model: str,
     # Optional: overwrite all auxiliary task providers
     if write_auxiliary:
         auxiliary = config.setdefault("auxiliary", {})
-        for task in ("vision", "web_extract", "compression", "session_search",
-                     "skills_hub", "approval", "mcp", "flush_memories"):
+        for task in _HERMES_AUX_TASKS:
             auxiliary.setdefault(task, {})["provider"] = hermes_pid
 
     # Non-destructive Copilot provider stub (Hermes canonical key: "copilot")

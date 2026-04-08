@@ -63,7 +63,7 @@ For each model family, bhoga tries providers in priority order:
 | `anthropic_api` | `anthropic` |
 | `openai-codex` | `openai-codex` |
 | `openai_api` | `openrouter` |
-| `github-copilot` | `github-copilot` |
+| `github-copilot` | `copilot` |
 
 ### State persistence
 
