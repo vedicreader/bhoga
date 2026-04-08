@@ -736,22 +736,14 @@ def test_parse_codex_quota_text_fallback():
 
 def test_router_eager_init_smoke(tmp_path):
     """Router with eager=True should complete background init without errors."""
-    from unittest.mock import patch
     p = tmp_path / "state.json"
     # Patch out all external I/O so the test is hermetic
     with patch("bhoga.bhoga.check_quota", return_value=None), \
          patch("bhoga.bhoga.fetch_models", return_value=[]):
         r = Router(state_path=p, eager=True)
-        # Give background thread time to complete
-        r._worker.join(timeout=0)          # worker is always running, don't block
-        import threading, time
-        for _ in range(50):                # wait up to 5 s for _init_bg to finish
-            if not any(t.name.startswith("Thread") and t.is_alive()
-                       for t in threading.enumerate()
-                       if t is not threading.current_thread() and t is not r._worker):
-                break
-            time.sleep(0.1)
+        # _ready is set at the end of _init_bg; wait up to 5 s
+        assert r._ready.wait(timeout=5), "_init_bg did not complete in time"
         rec = r.best_for("claude-opus-4")
-        assert rec is not None            # optimistic blank quota always routes
+        assert rec is not None  # optimistic blank quota always routes
         r.close()
 

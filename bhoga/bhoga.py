@@ -658,6 +658,7 @@ class Router:
     def __init__(self, *, state_path: Path | None = None, eager: bool = True):
         self._lock  = threading.Lock()
         self._path  = ifnone(state_path, STATE_PATH)
+        self._ready = threading.Event()  # set when _init_bg completes
         with self._lock:
             self._state: dict[str, ProviderQuota] = load_state(self._path)
         # Single worker thread drains all record_turn calls serially — prevents
@@ -667,6 +668,8 @@ class Router:
         self._worker.start()
         if eager:
             threading.Thread(target=self._init_bg, daemon=True).start()
+        else:
+            self._ready.set()  # no background init; mark ready immediately
 
     # ── key helpers ──────────────────────────────────────────────────────
 
@@ -723,6 +726,7 @@ class Router:
             except Exception as e:
                 log.debug("bhoga: bg init %s failed: %s", pid, e)
         self._save()
+        self._ready.set()
 
     # ── routing ──────────────────────────────────────────────────────────
 
@@ -889,7 +893,7 @@ class Router:
 
     def __del__(self) -> None:
         try: self.close()
-        except Exception: pass
+        except Exception as e: log.debug("bhoga: Router.__del__ close failed: %s", e)
 
     # ── introspection ────────────────────────────────────────────────────
 
