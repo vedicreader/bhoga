@@ -9,6 +9,18 @@ description = "Zero-server Python library that routes AI harnesses to the best a
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.11"
+keywords = ["ai", "llm", "routing", "quota", "claude", "openai", "anthropic", "codex", "copilot"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
 dependencies = [
     "fastcore>=1.7",
     "httpx>=0.27",
@@ -18,6 +30,11 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8"]
+
+[project.urls]
+Homepage = "https://github.com/vedicreader/bhoga"
+Source = "https://github.com/vedicreader/bhoga"
+"Bug Tracker" = "https://github.com/vedicreader/bhoga/issues"
 
 [tool.setuptools.packages.find]
 include = ["bhoga*"]

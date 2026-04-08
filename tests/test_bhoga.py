@@ -590,3 +590,168 @@ def test_apply_to_hermes_copilot_stub_not_overwritten(tmp_path):
     # Should preserve the user's custom URL
     assert config["providers"]["copilot"]["base_url"] == "https://my-proxy.example.com"
 
+
+# ── reset_if_due ─────────────────────────────────────────────────────────────
+
+def test_reset_if_due_fires_on_past_resets_at():
+    """A window whose resets_at is in the past should be zeroed out and True returned."""
+    past = datetime.now(timezone.utc) - timedelta(minutes=1)
+    q = ProviderQuota(
+        provider_id="claude_code", model_id="*",
+        windows={
+            "burst": QuotaWindow(name="burst", pct_used=90.0, resets_at=past,
+                                 window_min=300, updated_at=past),
+        },
+    )
+    fired = q.reset_if_due()
+    assert fired is True
+    assert q.windows["burst"].pct_used == 0.0
+    assert q.windows["burst"].resets_at is None
+    assert q.status == ProviderStatus.OK  # window reset → 100% remaining → OK
+
+def test_reset_if_due_does_not_fire_for_future():
+    """A window whose resets_at is in the future must not be reset."""
+    future = datetime.now(timezone.utc) + timedelta(hours=1)
+    q = ProviderQuota(
+        provider_id="claude_code", model_id="*",
+        windows={
+            "burst": QuotaWindow(name="burst", pct_used=80.0, resets_at=future,
+                                 window_min=300, updated_at=datetime.now(timezone.utc)),
+        },
+    )
+    fired = q.reset_if_due()
+    assert fired is False
+    assert q.windows["burst"].pct_used == 80.0
+
+def test_reset_if_due_persists_via_router(tmp_path):
+    """best_for() should call _save() when a window is reset, so the next Router sees it."""
+    past = datetime.now(timezone.utc) - timedelta(minutes=1)
+    p = tmp_path / "state.json"
+    state = {
+        "claude_code:claude-opus-4": ProviderQuota(
+            provider_id="claude_code", model_id="claude-opus-4", priority=1,
+            windows={"burst": QuotaWindow(name="burst", pct_used=90.0, resets_at=past,
+                                          window_min=300, updated_at=past)},
+        ),
+    }
+    save_state(state, p)
+    r = Router(state_path=p, eager=False)
+    r.best_for("claude-opus-4")  # triggers reset_if_due + _save
+
+    # A fresh router loading the same file should see pct_used=0
+    r2 = Router(state_path=p, eager=False)
+    q = r2._get("claude_code", "claude-opus-4")
+    assert q is not None
+    assert q.windows["burst"].pct_used == 0.0
+
+
+# ── _parse_claude_cli text parsing ───────────────────────────────────────────
+
+def test_parse_claude_cli_text_burst():
+    """_parse_claude_cli should extract the burst window from text output."""
+    from bhoga.bhoga import _parse_claude_cli
+    from unittest.mock import patch, MagicMock
+    mock_result = MagicMock()
+    mock_result.stdout = "Usage: 72% used in last 5 hours (burst window)"
+    with patch("subprocess.run", return_value=mock_result):
+        windows = _parse_claude_cli()
+    assert windows is not None
+    assert "burst" in windows
+    assert windows["burst"].pct_used == pytest.approx(72.0)
+
+def test_parse_claude_cli_text_weekly():
+    """_parse_claude_cli should detect the weekly window when context contains 'week'."""
+    from bhoga.bhoga import _parse_claude_cli
+    from unittest.mock import patch, MagicMock
+    mock_result = MagicMock()
+    mock_result.stdout = "Weekly quota: 45% used this week"
+    with patch("subprocess.run", return_value=mock_result):
+        windows = _parse_claude_cli()
+    assert windows is not None
+    assert "weekly" in windows
+    assert windows["weekly"].pct_used == pytest.approx(45.0)
+
+def test_parse_claude_cli_text_remaining():
+    """'remaining' direction should invert: 30% remaining → 70% used."""
+    from bhoga.bhoga import _parse_claude_cli
+    from unittest.mock import patch, MagicMock
+    mock_result = MagicMock()
+    mock_result.stdout = "30% remaining in burst window"
+    with patch("subprocess.run", return_value=mock_result):
+        windows = _parse_claude_cli()
+    assert windows is not None
+    assert windows["burst"].pct_used == pytest.approx(70.0)
+
+def test_parse_claude_cli_no_output():
+    """Empty stdout should return None."""
+    from bhoga.bhoga import _parse_claude_cli
+    from unittest.mock import patch, MagicMock
+    mock_result = MagicMock()
+    mock_result.stdout = ""
+    with patch("subprocess.run", return_value=mock_result):
+        assert _parse_claude_cli() is None
+
+
+# ── parse_codex_quota JSON path ───────────────────────────────────────────────
+
+def test_parse_codex_quota_json_burst():
+    """parse_codex_quota should parse JSON with a burst key."""
+    from bhoga.bhoga import parse_codex_quota
+    from unittest.mock import patch, MagicMock
+    payload = json.dumps({"burst": {"pct_used": 55.0}})
+    mock_result = MagicMock()
+    mock_result.stdout = payload
+    with patch("subprocess.run", return_value=mock_result):
+        windows = parse_codex_quota()
+    assert windows is not None
+    assert "burst" in windows
+    assert windows["burst"].pct_used == pytest.approx(55.0)
+
+def test_parse_codex_quota_json_utilization():
+    """parse_codex_quota should convert utilization (0-1) to pct_used (0-100)."""
+    from bhoga.bhoga import parse_codex_quota
+    from unittest.mock import patch, MagicMock
+    payload = json.dumps({"five_hour": {"utilization": 0.8}, "seven_day": {"utilization": 0.3}})
+    mock_result = MagicMock()
+    mock_result.stdout = payload
+    with patch("subprocess.run", return_value=mock_result):
+        windows = parse_codex_quota()
+    assert windows is not None
+    assert windows["burst"].pct_used  == pytest.approx(80.0)
+    assert windows["weekly"].pct_used == pytest.approx(30.0)
+
+def test_parse_codex_quota_text_fallback():
+    """parse_codex_quota falls back to text parse when output is not JSON."""
+    from bhoga.bhoga import parse_codex_quota
+    from unittest.mock import patch, MagicMock
+    mock_result = MagicMock()
+    mock_result.stdout = "gpt-5.4 high · 60% left · ~4h"
+    with patch("subprocess.run", return_value=mock_result):
+        windows = parse_codex_quota()
+    assert windows is not None
+    assert windows["burst"].pct_used == pytest.approx(40.0)  # 100 - 60
+
+
+# ── Router(eager=True) smoke test ─────────────────────────────────────────────
+
+def test_router_eager_init_smoke(tmp_path):
+    """Router with eager=True should complete background init without errors."""
+    from unittest.mock import patch
+    p = tmp_path / "state.json"
+    # Patch out all external I/O so the test is hermetic
+    with patch("bhoga.bhoga.check_quota", return_value=None), \
+         patch("bhoga.bhoga.fetch_models", return_value=[]):
+        r = Router(state_path=p, eager=True)
+        # Give background thread time to complete
+        r._worker.join(timeout=0)          # worker is always running, don't block
+        import threading, time
+        for _ in range(50):                # wait up to 5 s for _init_bg to finish
+            if not any(t.name.startswith("Thread") and t.is_alive()
+                       for t in threading.enumerate()
+                       if t is not threading.current_thread() and t is not r._worker):
+                break
+            time.sleep(0.1)
+        rec = r.best_for("claude-opus-4")
+        assert rec is not None            # optimistic blank quota always routes
+        r.close()
+
